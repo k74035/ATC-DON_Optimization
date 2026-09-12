@@ -1,0 +1,2114 @@
+# Revised: X_full=(local x, shared links); n_design_total includes both.
+# ATC response targets use model-derived bounds; all block solvers share bounds.
+# DON is online Adam optimization, not pretrained inference. Projected output
+# allows exact box boundaries; clipping can still slow learning near saturation.
+# CASE1B/1C vary both topology and total dimension (not isolated node effects).
+# Q2/Q4/Q6/EXP are function families, not a guaranteed difficulty ranking.
+# Reference errors are relative to a numerical SLSQP solution only.
+#!/usr/bin/env python3
+"""ATC-SQP vs ATC-DON controlled benchmark with target-response and linking variables.
+
+Research goal
+-------------
+Compare SQP and a Deep Optimizer Network (DON) as local subproblem solvers
+inside the *same* Analytical Target Cascading (ATC) coordination framework.
+
+The benchmark deliberately uses a regular balanced B-ary tree and equal local
+physical-design dimension m so that controlled case studies are possible.
+It is not intended to reproduce every possible engineering ATC topology.
+
+Each ATC element j has
+----------------------
+    x_j in R^m                         local physical design variables
+    y_j in R                           local copy of a shared linking variable
+                                       (non-root elements only)
+
+The local analysis quantity is
+
+    q_j(x_j, y_j)
+      = sum_k w_k [x_jk + eta*x_jk^2] / sum_k w_k + beta_y*y_j,
+
+    w_k = 1 + (k-1)/m.
+
+The root has no incoming linking variable, so its y term is zero.
+
+For response cascading,
+
+    R_j = q_j                                             (leaf)
+    R_j = alpha*q_j + (1-alpha)*mean(T_jc)               (internal)
+
+where T_jc is the response target assigned by parent j to child c.  For every
+edge e=(j,c), response consistency is
+
+    c_e^R = T_jc - R_c = 0.
+
+For linking-variable coordination, every internal parent j chooses one scalar
+shared linking target Y_j for *all* of its children.  Each child c owns a local
+copy y_c.  Hence the children of the same parent are coupled through
+
+    c_e^Y = Y_j - y_c = 0,       e=(j,c).
+
+This is a minimal, controlled realization of the ATC concept of a linking
+variable shared among sibling elements.  The linking dimension is fixed at one
+in the main study so it does not become another case-study factor.
+
+The local physical inequality at every element remains
+
+    g_j(x_j) = b - mean(x_j) <= 0,
+
+with common box bounds on x, response targets, and linking variables.
+
+Both ATC-SQP and ATC-DON use the same augmented-Lagrangian terms for response
+consistency, linking consistency, and the same PHR inequality treatment.  The
+principal difference is therefore the local subproblem solver.
+
+The undecomposed/AIO reference contains one physical shared linking variable
+Y_j for each internal parent j.  In the AIO model each child c uses the shared
+value of its parent, y_c = Y_parent(c).  Child responses are recursively
+substituted upward.  At simultaneous response and linking consistency, the
+ATC decomposed objective equals the AIO objective.
+
+Controlled factors
+------------------
+CASE 1A : local physical-design dimension m
+CASE 1B : coordination breadth / branching factor B
+CASE 1C : hierarchy depth D
+CASE 1D : local objective nonlinearity kappa
+CASE 1E : physical-constraint floor b (optional)
+CASE 2  : DON hyperparameter sensitivity
+
+Important scope limitation
+--------------------------
+The main benchmark fixes a regular balanced tree, a scalar linking variable,
+equal local physical-design dimensions, and one common response/constraint
+model.  Irregular trees, vector linking variables, heterogeneous dimensions,
+and subsystem-specific physics are reserved for separate validation studies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import json
+import math
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from scipy.optimize import minimize
+import torch
+from torch import nn
+
+# Keep CPU timing less noisy and make PyTorch calculations reproducible enough
+# for the controlled comparisons.
+torch.set_num_threads(1)
+torch.set_default_dtype(torch.float64)
+
+KAPPA_CLASSES = ("Q2", "Q4", "Q6", "EXP")
+
+
+# ============================================================================
+# Benchmark scalar functions
+# ============================================================================
+
+
+def phi_np(x: np.ndarray, kappa: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Return phi_kappa(x) and its elementwise derivative."""
+    x = np.asarray(x, dtype=float)
+    if kappa == "Q2":
+        return x**2, 2.0 * x
+    if kappa == "Q4":
+        return x**4, 4.0 * x**3
+    if kappa == "Q6":
+        return x**6, 6.0 * x**5
+    if kappa == "EXP":
+        den = math.e - 1.0
+        ex = np.exp(x**2)
+        return (ex - 1.0) / den, 2.0 * x * ex / den
+    raise ValueError(f"Unsupported kappa={kappa!r}; choose from {KAPPA_CLASSES}")
+
+
+def phi_torch(x: torch.Tensor, kappa: str) -> torch.Tensor:
+    if kappa == "Q2":
+        return x**2
+    if kappa == "Q4":
+        return x**4
+    if kappa == "Q6":
+        return x**6
+    if kappa == "EXP":
+        return (torch.exp(x**2) - 1.0) / (math.e - 1.0)
+    raise ValueError(f"Unsupported kappa={kappa!r}")
+
+
+# ============================================================================
+# Configuration and regular B-ary ATC tree
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    # Local physical-design dimension and hierarchy geometry.
+    m: int = 8
+    B: int = 2
+    D: int = 3
+
+    # Local objective class.
+    kappa: str = "Q2"
+
+    # Response model / hierarchy aggregation.
+    alpha: float = 0.5
+    response_eta: float = 0.15
+
+    # Fixed scalar linking-variable coupling.  This is deliberately NOT a main
+    # case-study factor; n_y=1 for every sibling group.
+    link_beta: float = 0.25
+
+    # Physical inequality: b - mean(x_j) <= 0.
+    b: float = 0.10
+
+    # Root-level desired system response and weight.
+    system_target: float = 0.75
+    system_weight: float = 10.0
+
+    # Common box bounds for physical designs, response targets and linking vars.
+    lower: float = -2.0
+    upper: float = 2.0
+
+    def __post_init__(self) -> None:
+        if self.m < 1:
+            raise ValueError("m must be >= 1")
+        if self.B < 1:
+            raise ValueError("B must be >= 1")
+        if self.D < 1:
+            raise ValueError("D must be >= 1")
+        if self.kappa not in KAPPA_CLASSES:
+            raise ValueError(f"kappa must be one of {KAPPA_CLASSES}")
+        if not (0.0 <= self.alpha <= 1.0):
+            raise ValueError("alpha must be in [0,1]")
+        if self.response_eta < 0.0:
+            raise ValueError("response_eta must be >= 0")
+        if self.link_beta < 0.0:
+            raise ValueError("link_beta must be >= 0")
+        # Keep x + eta*x^2 monotone over the configured x box.
+        if 1.0 + 2.0 * self.response_eta * self.lower <= 0.0:
+            raise ValueError(
+                "response_eta is too large for the lower design bound; "
+                "x + eta*x^2 must remain monotone on the box"
+            )
+        if not (self.lower < self.b < self.upper):
+            raise ValueError("b must lie strictly inside the box bounds")
+        if not (self.lower < self.system_target < self.upper):
+            raise ValueError("system_target must lie inside the box bounds")
+        if self.system_weight <= 0:
+            raise ValueError("system_weight must be positive")
+
+    @property
+    def N_ATC(self) -> int:
+        if self.B == 1:
+            return self.D
+        return (self.B**self.D - 1) // (self.B - 1)
+
+    @property
+    def N_edge(self) -> int:
+        return max(0, self.N_ATC - 1)
+
+    @property
+    def N_internal(self) -> int:
+        """Number of parents that own a shared child-linking target."""
+        if self.D <= 1:
+            return 0
+        if self.B == 1:
+            return self.D - 1
+        return (self.B ** (self.D - 1) - 1) // (self.B - 1)
+
+    @property
+    def n_local_design_total(self) -> int:
+        return self.N_ATC * self.m
+
+    @property
+    def n_design_total(self) -> int:
+        """Independent physical variables: local x plus shared linking variables."""
+        return self.n_local_design_total + self.N_internal
+
+    @property
+    def n_response_target_total(self) -> int:
+        return self.N_edge
+
+    @property
+    def n_link_copy_total(self) -> int:
+        # Every non-root element has one local copy y_j.
+        return self.N_edge
+
+    @property
+    def n_link_target_total(self) -> int:
+        # Every internal parent has one shared target Y_j for its children.
+        return self.N_internal
+
+    @property
+    def n_decomposed_primal_total(self) -> int:
+        return (
+            self.n_local_design_total
+            + self.n_response_target_total
+            + self.n_link_copy_total
+            + self.n_link_target_total
+        )
+
+    def short_label(self) -> str:
+        return (
+            f"m{self.m}_B{self.B}_D{self.D}_{self.kappa}_"
+            f"a{self.alpha:g}_eta{self.response_eta:g}_"
+            f"by{self.link_beta:g}_b{self.b:g}"
+        )
+
+
+class RegularTreeATCBenchmark:
+    """Regular balanced B-ary ATC benchmark with response and linking coupling."""
+
+    def __init__(self, config: BenchmarkConfig):
+        self.config = config
+        self.m = config.m
+        self.B = config.B
+        self.D = config.D
+        self.N = config.N_ATC
+
+        self.children: List[List[int]] = [[] for _ in range(self.N)]
+        self.parent: List[Optional[int]] = [None for _ in range(self.N)]
+        self.level = np.zeros(self.N, dtype=int)
+
+        # Heap-like indexing for a complete regular B-ary tree.
+        for j in range(self.N):
+            for q in range(self.B):
+                child = self.B * j + q + 1
+                if child < self.N:
+                    self.children[j].append(child)
+                    self.parent[child] = j
+                    self.level[child] = self.level[j] + 1
+
+        self.edges: List[Tuple[int, int]] = []
+        self.edge_of_child: List[Optional[int]] = [None] * self.N
+        self.out_edges: List[List[int]] = [[] for _ in range(self.N)]
+        for p in range(self.N):
+            for c in self.children[p]:
+                e = len(self.edges)
+                self.edges.append((p, c))
+                self.edge_of_child[c] = e
+                self.out_edges[p].append(e)
+        if len(self.edges) != config.N_edge:
+            raise RuntimeError("Tree construction error")
+
+        # One physical/shared scalar linking variable for every internal parent.
+        self.internal_nodes = [j for j in range(self.N) if self.children[j]]
+        self.link_target_index_of_parent: Dict[int, int] = {
+            p: q for q, p in enumerate(self.internal_nodes)
+        }
+        if len(self.internal_nodes) != config.N_internal:
+            raise RuntimeError("Internal-node count mismatch")
+
+        # Deterministic within-node physical-design response weights.
+        # For m=4: [1.00, 1.25, 1.50, 1.75] before normalization.
+        self.response_weights = 1.0 + np.arange(self.m, dtype=float) / self.m
+        self.response_weight_sum = float(np.sum(self.response_weights))
+
+        # Structural coefficient s_j such that
+        # R_root^AIO = sum_j s_j*q_j for any q_j values.
+        self.root_response_weights = self._compute_root_response_weights()
+
+    # ------------------------------------------------------------------ tree
+
+    def _compute_root_response_weights(self) -> np.ndarray:
+        cfg = self.config
+        path = np.zeros(self.N, dtype=float)
+        path[0] = 1.0
+        weight = np.zeros(self.N, dtype=float)
+        for j in range(self.N):
+            kids = self.children[j]
+            if kids:
+                weight[j] += path[j] * cfg.alpha
+                share = path[j] * (1.0 - cfg.alpha) / len(kids)
+                for c in kids:
+                    path[c] += share
+            else:
+                weight[j] += path[j]
+        if not np.isclose(np.sum(weight), 1.0, atol=1e-12):
+            raise RuntimeError(f"Response weights do not sum to 1: {weight.sum()}")
+        return weight
+
+    def _layout(self, j: int) -> Tuple[Optional[int], slice, Optional[int], int]:
+        """Decision layout z_j=[x_j, y_j?, response_targets..., Y_j?]."""
+        idx = self.m
+        y_in_idx: Optional[int] = None
+        if j != 0:
+            y_in_idx = idx
+            idx += 1
+        nchild = len(self.children[j])
+        t_slice = slice(idx, idx + nchild)
+        idx += nchild
+        y_out_idx: Optional[int] = None
+        if nchild:
+            y_out_idx = idx
+            idx += 1
+        return y_in_idx, t_slice, y_out_idx, idx
+
+    def decision_bounds(self, j):
+        """Physical x/y bounds and conservative, model-derived response bounds."""
+        cfg = self.config
+        lo = np.full(self.node_decision_dim(j), cfg.lower)
+        hi = np.full(self.node_decision_dim(j), cfg.upper)
+        _, ts, _, _ = self._layout(j)
+        # q is monotone on the physical box; aggregation is a convex combination.
+        # Including zero covers the root's absent incoming linking variable.
+        lo[ts] = cfg.lower + cfg.response_eta*cfg.lower**2 + min(0., cfg.link_beta*cfg.lower)
+        hi[ts] = cfg.upper + cfg.response_eta*cfg.upper**2 + max(0., cfg.link_beta*cfg.upper)
+        return lo, hi
+
+    def node_decision_dim(self, j: int) -> int:
+        return self._layout(j)[3]
+
+    def decision(
+        self,
+        j: int,
+        x_all: np.ndarray,
+        y_local: np.ndarray,
+        targets: np.ndarray,
+        link_targets: np.ndarray,
+    ) -> np.ndarray:
+        y_in_idx, t_slice, y_out_idx, dim = self._layout(j)
+        z = np.empty(dim, dtype=float)
+        z[: self.m] = x_all[j]
+        if y_in_idx is not None:
+            z[y_in_idx] = y_local[j]
+        if self.children[j]:
+            z[t_slice] = targets[self.out_edges[j]]
+            assert y_out_idx is not None
+            z[y_out_idx] = link_targets[self.link_target_index_of_parent[j]]
+        return z
+
+    def set_decision(
+        self,
+        j: int,
+        z: np.ndarray,
+        x_all: np.ndarray,
+        y_local: np.ndarray,
+        targets: np.ndarray,
+        link_targets: np.ndarray,
+    ) -> None:
+        z = np.asarray(z, dtype=float)
+        y_in_idx, t_slice, y_out_idx, dim = self._layout(j)
+        if z.size != dim:
+            raise ValueError("local decision has wrong dimension")
+        x_all[j] = z[: self.m]
+        if y_in_idx is not None:
+            y_local[j] = z[y_in_idx]
+        if self.children[j]:
+            targets[self.out_edges[j]] = z[t_slice]
+            assert y_out_idx is not None
+            link_targets[self.link_target_index_of_parent[j]] = z[y_out_idx]
+
+    # ---------------------------------------------------------- response model
+
+    def local_analysis(
+        self, x_j: np.ndarray, y_j: float = 0.0
+    ) -> Tuple[float, np.ndarray, float]:
+        """Return q_j(x_j,y_j), dq/dx_j, dq/dy_j.
+
+        q_j = sum_k w_k*(x_jk + eta*x_jk^2)/sum_k(w_k) + beta_y*y_j.
+        """
+        x_j = np.asarray(x_j, dtype=float)
+        eta = self.config.response_eta
+        q_terms = x_j + eta * x_j**2
+        qx = float(np.dot(self.response_weights, q_terms) / self.response_weight_sum)
+        dqdx = self.response_weights * (1.0 + 2.0 * eta * x_j) / self.response_weight_sum
+        q = qx + self.config.link_beta * float(y_j)
+        dqdy = self.config.link_beta
+        return float(q), np.asarray(dqdx, dtype=float), float(dqdy)
+
+    def local_analysis_torch(self, x_j: torch.Tensor, y_j: torch.Tensor) -> torch.Tensor:
+        weights = torch.as_tensor(
+            self.response_weights, dtype=x_j.dtype, device=x_j.device
+        )
+        eta = self.config.response_eta
+        qx = torch.sum(weights * (x_j + eta * x_j**2)) / self.response_weight_sum
+        return qx + self.config.link_beta * y_j
+
+    def _parts_from_z(
+        self, j: int, z: np.ndarray
+    ) -> Tuple[np.ndarray, float, np.ndarray, Optional[float]]:
+        z = np.asarray(z, dtype=float)
+        y_in_idx, t_slice, y_out_idx, dim = self._layout(j)
+        if z.size != dim:
+            raise ValueError("local decision has wrong dimension")
+        x = z[: self.m]
+        y_in = 0.0 if y_in_idx is None else float(z[y_in_idx])
+        t_out = np.asarray(z[t_slice], dtype=float)
+        y_out = None if y_out_idx is None else float(z[y_out_idx])
+        return x, y_in, t_out, y_out
+
+    def node_response_from_parts(
+        self, x_j: np.ndarray, y_j: float, child_targets: np.ndarray
+    ) -> float:
+        q, _, _ = self.local_analysis(x_j, y_j)
+        if child_targets.size == 0:
+            return q
+        a = self.config.alpha
+        return float(a * q + (1.0 - a) * np.mean(child_targets))
+
+    def node_response_from_z(self, j: int, z: np.ndarray) -> float:
+        x, y_in, t_out, _ = self._parts_from_z(j, z)
+        return self.node_response_from_parts(x, y_in, t_out)
+
+    def node_response_grad(self, j: int, z: np.ndarray) -> np.ndarray:
+        """Gradient dR_j/dz_j for explicit decomposed response."""
+        x, y_in, t_out, _ = self._parts_from_z(j, z)
+        _, dqdx, dqdy = self.local_analysis(x, y_in)
+        y_in_idx, t_slice, _, dim = self._layout(j)
+        grad = np.zeros(dim, dtype=float)
+        if len(self.children[j]) == 0:
+            scale = 1.0
+        else:
+            scale = self.config.alpha
+        grad[: self.m] = scale * dqdx
+        if y_in_idx is not None:
+            grad[y_in_idx] = scale * dqdy
+        if len(self.children[j]):
+            grad[t_slice] = (1.0 - self.config.alpha) / len(self.children[j])
+        return grad
+
+    def responses(
+        self, x_all: np.ndarray, y_local: np.ndarray, targets: np.ndarray
+    ) -> np.ndarray:
+        """Explicit ATC responses using local linking copies and outgoing targets."""
+        r = np.zeros(self.N, dtype=float)
+        for j in range(self.N):
+            yj = 0.0 if j == 0 else float(y_local[j])
+            child_targets = targets[self.out_edges[j]] if self.children[j] else np.empty(0)
+            r[j] = self.node_response_from_parts(x_all[j], yj, child_targets)
+        return r
+
+    def physical_local_links(self, link_targets: np.ndarray) -> np.ndarray:
+        """Map physical sibling-group linking variables to every element copy."""
+        y = np.zeros(self.N, dtype=float)
+        for child in range(1, self.N):
+            p = self.parent[child]
+            assert p is not None
+            y[child] = link_targets[self.link_target_index_of_parent[p]]
+        return y
+
+    def true_responses(self, x_all: np.ndarray, link_targets: np.ndarray) -> np.ndarray:
+        """AIO responses using one physical shared link variable per sibling group."""
+        y_phys = self.physical_local_links(link_targets)
+        r = np.zeros(self.N, dtype=float)
+        for j in reversed(range(self.N)):
+            q, _, _ = self.local_analysis(x_all[j], 0.0 if j == 0 else y_phys[j])
+            kids = self.children[j]
+            if kids:
+                a = self.config.alpha
+                r[j] = a * q + (1.0 - a) * float(np.mean(r[kids]))
+            else:
+                r[j] = q
+        return r
+
+    def consistent_targets(self, x_all: np.ndarray, link_targets: np.ndarray) -> np.ndarray:
+        r_true = self.true_responses(x_all, link_targets)
+        t = np.zeros(self.config.N_edge, dtype=float)
+        for e, (_, c) in enumerate(self.edges):
+            t[e] = r_true[c]
+        return t
+
+    def consistent_link_copies(self, link_targets: np.ndarray) -> np.ndarray:
+        return self.physical_local_links(link_targets)
+
+    def response_consistency_residuals(
+        self, x_all: np.ndarray, y_local: np.ndarray, targets: np.ndarray
+    ) -> np.ndarray:
+        r = self.responses(x_all, y_local, targets)
+        c = np.zeros(self.config.N_edge, dtype=float)
+        for e, (_, child) in enumerate(self.edges):
+            c[e] = targets[e] - r[child]
+        return c
+
+    def link_consistency_residuals(
+        self, y_local: np.ndarray, link_targets: np.ndarray
+    ) -> np.ndarray:
+        c = np.zeros(self.config.N_edge, dtype=float)
+        for e, (parent, child) in enumerate(self.edges):
+            Y = link_targets[self.link_target_index_of_parent[parent]]
+            c[e] = Y - y_local[child]
+        return c
+
+    # ------------------------------------------------------------- objectives
+
+    def local_design_cost(self, x_j: np.ndarray) -> Tuple[float, np.ndarray]:
+        val, grad = phi_np(x_j, self.config.kappa)
+        return float(np.mean(val)), np.asarray(grad, dtype=float) / self.m
+
+    def global_objective(
+        self, x_all: np.ndarray, link_targets: np.ndarray
+    ) -> Tuple[float, np.ndarray, np.ndarray, float]:
+        """AIO objective, gradients wrt x and shared links, and root response."""
+        cfg = self.config
+        x_all = np.asarray(x_all, dtype=float).reshape(self.N, self.m)
+        link_targets = np.asarray(link_targets, dtype=float).reshape(cfg.N_internal)
+
+        J = 0.0
+        grad_x = np.zeros_like(x_all)
+        for j in range(self.N):
+            fj, gj = self.local_design_cost(x_all[j])
+            J += fj
+            grad_x[j] += gj
+
+        y_phys = self.physical_local_links(link_targets)
+        q_all = np.zeros(self.N, dtype=float)
+        dqdx_all = np.zeros_like(x_all)
+        for j in range(self.N):
+            q_all[j], dqdx_all[j], _ = self.local_analysis(
+                x_all[j], 0.0 if j == 0 else y_phys[j]
+            )
+
+        r_root = float(np.dot(self.root_response_weights, q_all))
+        mismatch = r_root - cfg.system_target
+        J += cfg.system_weight * self.N * mismatch**2
+        factor = 2.0 * cfg.system_weight * self.N * mismatch
+
+        for j in range(self.N):
+            grad_x[j] += factor * self.root_response_weights[j] * dqdx_all[j]
+
+        grad_link = np.zeros(cfg.N_internal, dtype=float)
+        for parent in self.internal_nodes:
+            qidx = self.link_target_index_of_parent[parent]
+            # The parent's shared Y affects q_c for every direct child c.
+            dr_dY = cfg.link_beta * float(
+                np.sum(self.root_response_weights[self.children[parent]])
+            )
+            grad_link[qidx] = factor * dr_dY
+
+        return float(J), grad_x, grad_link, r_root
+
+    def decomposed_objective(
+        self, x_all: np.ndarray, y_local: np.ndarray, targets: np.ndarray
+    ) -> float:
+        """Objective in decomposed variables, excluding AL coordination terms."""
+        total = sum(self.local_design_cost(x_all[j])[0] for j in range(self.N))
+        r0 = self.responses(x_all, y_local, targets)[0]
+        total += self.config.system_weight * self.N * (r0 - self.config.system_target) ** 2
+        return float(total)
+
+    # --------------------------------------------------------- physical g_j <= 0
+
+    def inequality(self, x_j: np.ndarray) -> Tuple[float, np.ndarray]:
+        """g_j=b-mean(x_j)<=0.  Linking variables are not part of g_j."""
+        g = float(self.config.b - np.mean(x_j))
+        dg = -np.ones(self.m, dtype=float) / self.m
+        return g, dg
+
+    def constraint_violations(self, x_all: np.ndarray) -> np.ndarray:
+        return np.maximum(0.0, self.config.b - np.mean(x_all, axis=1))
+
+    # ------------------------------------------------------------- local AL
+
+    @staticmethod
+    def phr_value_grad_scalar(g: float, mu: float, rho_g: float) -> Tuple[float, float]:
+        """PHR inequality AL value and d(value)/dg for g<=0, mu>=0."""
+        s = mu + rho_g * g
+        pos = max(0.0, s)
+        value = (pos**2 - mu**2) / (2.0 * rho_g)
+        return float(value), float(pos)
+
+    def local_loss_grad(
+        self,
+        j: int,
+        z: np.ndarray,
+        x_all: np.ndarray,
+        y_local: np.ndarray,
+        targets: np.ndarray,
+        link_targets: np.ndarray,
+        lambda_r: np.ndarray,
+        rho_r: float,
+        lambda_y: np.ndarray,
+        rho_y: float,
+        mu_g: np.ndarray,
+        rho_g: float,
+    ) -> Tuple[float, np.ndarray]:
+        """Local augmented objective and analytic gradient wrt z_j."""
+        cfg = self.config
+        z = np.asarray(z, dtype=float)
+        x_j, y_in, t_out, y_out = self._parts_from_z(j, z)
+        y_in_idx, t_slice, y_out_idx, _ = self._layout(j)
+
+        # Local physical design cost.
+        loss, gx = self.local_design_cost(x_j)
+        grad = np.zeros_like(z)
+        grad[: self.m] += gx
+
+        # Explicit node response and derivative wrt local decision block.
+        r_j = self.node_response_from_parts(x_j, y_in, t_out)
+        dr = self.node_response_grad(j, z)
+
+        # Root system objective.
+        if j == 0:
+            mismatch = r_j - cfg.system_target
+            loss += cfg.system_weight * self.N * mismatch**2
+            grad += 2.0 * cfg.system_weight * self.N * mismatch * dr
+
+        # Incoming response consistency: T_parent,j - R_j.
+        e_in = self.edge_of_child[j]
+        if e_in is not None:
+            c_in = float(targets[e_in] - r_j)
+            coeff = float(lambda_r[e_in] + rho_r * c_in)
+            loss += float(lambda_r[e_in] * c_in + 0.5 * rho_r * c_in**2)
+            grad += -coeff * dr
+
+            # Incoming linking consistency: Y_parent - y_j.
+            assert y_in_idx is not None
+            p = self.parent[j]
+            assert p is not None
+            Y_parent = link_targets[self.link_target_index_of_parent[p]]
+            cy_in = float(Y_parent - y_in)
+            coeff_y = float(lambda_y[e_in] + rho_y * cy_in)
+            loss += float(lambda_y[e_in] * cy_in + 0.5 * rho_y * cy_in**2)
+            grad[y_in_idx] += -coeff_y
+
+        # Outgoing response and linking consistencies controlled by parent j.
+        if self.children[j]:
+            current_r = self.responses(x_all, y_local, targets)
+            assert y_out_idx is not None and y_out is not None
+            for q, e in enumerate(self.out_edges[j]):
+                _, child = self.edges[e]
+
+                cr_out = float(t_out[q] - current_r[child])
+                coeff_r = float(lambda_r[e] + rho_r * cr_out)
+                loss += float(lambda_r[e] * cr_out + 0.5 * rho_r * cr_out**2)
+                grad[t_slice.start + q] += coeff_r
+
+                cy_out = float(y_out - y_local[child])
+                coeff_y = float(lambda_y[e] + rho_y * cy_out)
+                loss += float(lambda_y[e] * cy_out + 0.5 * rho_y * cy_out**2)
+                grad[y_out_idx] += coeff_y
+
+        # Same PHR physical inequality term for SQP and DON.
+        g, dg = self.inequality(x_j)
+        phr, dphr_dg = self.phr_value_grad_scalar(g, float(mu_g[j]), rho_g)
+        loss += phr
+        grad[: self.m] += dphr_dg * dg
+
+        return float(loss), np.asarray(grad, dtype=float)
+
+    def local_loss_torch(
+        self,
+        j: int,
+        z: torch.Tensor,
+        x_all: np.ndarray,
+        y_local: np.ndarray,
+        targets: np.ndarray,
+        link_targets: np.ndarray,
+        lambda_r: np.ndarray,
+        rho_r: float,
+        lambda_y: np.ndarray,
+        rho_y: float,
+        mu_g: np.ndarray,
+        rho_g: float,
+    ) -> torch.Tensor:
+        cfg = self.config
+        y_in_idx, t_slice, y_out_idx, _ = self._layout(j)
+        x = z[: self.m]
+        y_in = torch.zeros((), dtype=z.dtype, device=z.device) if y_in_idx is None else z[y_in_idx]
+        t_out = z[t_slice]
+        y_out = None if y_out_idx is None else z[y_out_idx]
+
+        loss = torch.mean(phi_torch(x, cfg.kappa))
+        q_local = self.local_analysis_torch(x, y_in)
+        if self.children[j]:
+            r_j = cfg.alpha * q_local + (1.0 - cfg.alpha) * torch.mean(t_out)
+        else:
+            r_j = q_local
+
+        if j == 0:
+            loss = loss + cfg.system_weight * self.N * (r_j - cfg.system_target) ** 2
+
+        e_in = self.edge_of_child[j]
+        if e_in is not None:
+            cr_in = torch.as_tensor(float(targets[e_in])) - r_j
+            loss = loss + float(lambda_r[e_in]) * cr_in + 0.5 * rho_r * cr_in**2
+
+            p = self.parent[j]
+            assert p is not None and y_in_idx is not None
+            Y_parent = float(link_targets[self.link_target_index_of_parent[p]])
+            cy_in = torch.as_tensor(Y_parent) - y_in
+            loss = loss + float(lambda_y[e_in]) * cy_in + 0.5 * rho_y * cy_in**2
+
+        if self.children[j]:
+            current_r = self.responses(x_all, y_local, targets)
+            assert y_out is not None
+            for qidx, e in enumerate(self.out_edges[j]):
+                _, child = self.edges[e]
+                cr_out = t_out[qidx] - float(current_r[child])
+                loss = loss + float(lambda_r[e]) * cr_out + 0.5 * rho_r * cr_out**2
+
+                cy_out = y_out - float(y_local[child])
+                loss = loss + float(lambda_y[e]) * cy_out + 0.5 * rho_y * cy_out**2
+
+        # PHR inequality term, shared mathematically by SQP and DON.
+        g = cfg.b - torch.mean(x)
+        s = float(mu_g[j]) + rho_g * g
+        pos = torch.relu(s)
+        loss = loss + (pos**2 - float(mu_g[j]) ** 2) / (2.0 * rho_g)
+        return loss
+
+    # -------------------------------------------------------------- DON context
+
+    def local_context(
+        self,
+        j: int,
+        x_all: np.ndarray,
+        y_local: np.ndarray,
+        targets: np.ndarray,
+        link_targets: np.ndarray,
+        lambda_r: np.ndarray,
+        rho_r: float,
+        lambda_y: np.ndarray,
+        rho_y: float,
+        mu_g: np.ndarray,
+        rho_g: float,
+    ) -> np.ndarray:
+        """Node context; first entries are always the current local decision z_j."""
+        z = self.decision(j, x_all, y_local, targets, link_targets)
+        kids = self.children[j]
+        current_r = self.responses(x_all, y_local, targets)
+
+        e_in = self.edge_of_child[j]
+        if e_in is None:
+            t_in = lam_r_in = Y_in = lam_y_in = 0.0
+        else:
+            t_in = float(targets[e_in])
+            lam_r_in = float(lambda_r[e_in])
+            p = self.parent[j]
+            assert p is not None
+            Y_in = float(link_targets[self.link_target_index_of_parent[p]])
+            lam_y_in = float(lambda_y[e_in])
+
+        child_r = np.asarray([current_r[c] for c in kids], dtype=float)
+        child_y = np.asarray([y_local[c] for c in kids], dtype=float)
+        lam_r_out = np.asarray([lambda_r[e] for e in self.out_edges[j]], dtype=float)
+        lam_y_out = np.asarray([lambda_y[e] for e in self.out_edges[j]], dtype=float)
+
+        meta = np.array(
+            [
+                t_in,
+                lam_r_in,
+                Y_in,
+                lam_y_in,
+                float(mu_g[j]),
+                1.0 if j == 0 else 0.0,
+                1.0 if not kids else 0.0,
+                self.level[j] / max(1, self.D - 1),
+                self.config.b,
+                self.config.system_target,
+                self.config.alpha,
+                self.config.link_beta,
+                math.log1p(rho_r),
+                math.log1p(rho_y),
+                math.log1p(rho_g),
+            ],
+            dtype=float,
+        )
+        return np.concatenate([z, child_r, child_y, lam_r_out, lam_y_out, meta])
+
+    # ------------------------------------------------------------ initialization
+
+    def initial_state(
+        self, seed: int, scale: float = 0.25
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(seed)
+        x = rng.uniform(-scale, scale, size=(self.N, self.m))
+        x = np.clip(x, self.config.lower + 1e-8, self.config.upper - 1e-8)
+
+        link_targets = rng.uniform(-scale, scale, size=self.config.N_internal)
+        link_targets = np.clip(
+            link_targets, self.config.lower + 1e-8, self.config.upper - 1e-8
+        )
+        y_local = self.consistent_link_copies(link_targets)
+        targets = self.consistent_targets(x, link_targets)
+        return x, y_local, targets, link_targets
+
+    # ---------------------------------------------------------------- self test
+
+    def check_decomposition(
+        self, x_all: np.ndarray, link_targets: np.ndarray, atol: float = 1e-10
+    ) -> None:
+        y_local = self.consistent_link_copies(link_targets)
+        targets = self.consistent_targets(x_all, link_targets)
+        cr = self.response_consistency_residuals(x_all, y_local, targets)
+        cy = self.link_consistency_residuals(y_local, link_targets)
+        if cr.size and np.max(np.abs(cr)) > atol:
+            raise AssertionError(f"response residual {np.max(np.abs(cr))}")
+        if cy.size and np.max(np.abs(cy)) > atol:
+            raise AssertionError(f"link residual {np.max(np.abs(cy))}")
+        r_explicit = self.responses(x_all, y_local, targets)
+        r_true = self.true_responses(x_all, link_targets)
+        if not np.allclose(r_explicit, r_true, atol=atol, rtol=0):
+            raise AssertionError("Explicit responses do not match AIO recursive responses")
+        J_aio = self.global_objective(x_all, link_targets)[0]
+        J_dec = self.decomposed_objective(x_all, y_local, targets)
+        if not np.isclose(J_aio, J_dec, atol=atol, rtol=0):
+            raise AssertionError(("objective decomposition", J_aio, J_dec))
+
+
+# ============================================================================
+# AIO numerical reference
+# ============================================================================
+
+
+def _solve_aio_sqp_once(
+    benchmark: RegularTreeATCBenchmark,
+    x0: Optional[np.ndarray] = None,
+    link0: Optional[np.ndarray] = None,
+    maxiter: int = 2000,
+    ftol: float = 1e-12,
+) -> Dict:
+    """Solve the undecomposed physical problem with SLSQP as a reference."""
+    cfg = benchmark.config
+    if x0 is None:
+        x0 = np.full((benchmark.N, benchmark.m), max(cfg.b, 0.15), dtype=float)
+    else:
+        x0 = np.asarray(x0, dtype=float).reshape(benchmark.N, benchmark.m).copy()
+        for j in range(benchmark.N):
+            deficit = cfg.b - float(np.mean(x0[j]))
+            if deficit > 0:
+                x0[j] += deficit + 1e-4
+        x0 = np.clip(x0, cfg.lower, cfg.upper)
+
+    if link0 is None:
+        link0 = np.zeros(cfg.N_internal, dtype=float)
+    else:
+        link0 = np.asarray(link0, dtype=float).reshape(cfg.N_internal).copy()
+    link0 = np.clip(link0, cfg.lower, cfg.upper)
+
+    nx = benchmark.N * benchmark.m
+
+    def unpack(flat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        x = flat[:nx].reshape(benchmark.N, benchmark.m)
+        y = flat[nx:]
+        return x, y
+
+    def fun(flat: np.ndarray) -> Tuple[float, np.ndarray]:
+        x, y = unpack(flat)
+        J, gx, gy, _ = benchmark.global_objective(x, y)
+        return J, np.concatenate([gx.ravel(), gy])
+
+    # scipy SLSQP uses c(x)>=0. Here c_j=mean(x_j)-b.
+    def cons_fun(flat: np.ndarray) -> np.ndarray:
+        x, _ = unpack(flat)
+        return np.mean(x, axis=1) - cfg.b
+
+    def cons_jac(flat: np.ndarray) -> np.ndarray:
+        jac = np.zeros((benchmark.N, nx + cfg.N_internal), dtype=float)
+        for j in range(benchmark.N):
+            jac[j, j * benchmark.m : (j + 1) * benchmark.m] = 1.0 / benchmark.m
+        return jac
+
+    flat0 = np.concatenate([x0.ravel(), link0])
+    bounds = [(cfg.lower, cfg.upper)] * flat0.size
+
+    start = time.perf_counter()
+    res = minimize(
+        fun,
+        flat0,
+        jac=True,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=[{"type": "ineq", "fun": cons_fun, "jac": cons_jac}],
+        options={"maxiter": maxiter, "ftol": ftol, "disp": False},
+    )
+    elapsed = time.perf_counter() - start
+    x, link_targets = unpack(res.x)
+    J, _, _, r0 = benchmark.global_objective(x, link_targets)
+    return {
+        "method": "AIO-SQP",
+        "success": bool(res.success),
+        "message": str(res.message),
+        "x": x,
+        "link_targets": link_targets,
+        "objective": float(J),
+        "root_response": float(r0),
+        "constraint_violation": float(np.max(benchmark.constraint_violations(x))),
+        "iterations": int(res.nit),
+        "evaluations": int(res.nfev),
+        "time": float(elapsed),
+    }
+
+
+# ============================================================================
+# Local SQP and DON solvers
+# ============================================================================
+
+
+def solve_aio_sqp(benchmark, x0=None, link0=None, maxiter=2000, ftol=1e-12):
+    """Three-start numerical reference; explicit initial conditions use one start.
+
+    Report total search time/evaluations, never the best run's time alone.
+    A successful SLSQP exit does not certify global optimality.
+    """
+    runs = [_solve_aio_sqp_once(benchmark, x0, link0, maxiter, ftol)]
+    if x0 is None and link0 is None:
+        for seed in (17, 41):
+            xx, _, _, yy = benchmark.initial_state(seed, 0.75)
+            runs.append(_solve_aio_sqp_once(benchmark, xx, yy, maxiter, ftol))
+    candidates = [r for r in runs if r['success'] and r['constraint_violation'] <= 1e-6]
+    best = dict(min(candidates or runs, key=lambda r: r['objective']))
+    best['success'] = bool(candidates)
+    best['time'] = sum(r['time'] for r in runs)
+    best['evaluations'] = sum(r['evaluations'] for r in runs)
+    best['iterations'] = sum(r['iterations'] for r in runs)
+    best['reference_starts'] = len(runs)
+    return best
+
+
+def projected_grad_inf(
+    z: np.ndarray, grad: np.ndarray, lower: float, upper: float, atol: float = 1e-9
+) -> float:
+    # Unit-step projected gradient mapping, valid for scalar or vector bounds.
+    return float(np.max(np.abs(z - np.clip(z - grad, lower, upper))))
+
+
+
+def solve_local_sqp(
+    benchmark: RegularTreeATCBenchmark,
+    j: int,
+    x_all: np.ndarray,
+    y_local: np.ndarray,
+    targets: np.ndarray,
+    link_targets: np.ndarray,
+    lambda_r: np.ndarray,
+    rho_r: float,
+    lambda_y: np.ndarray,
+    rho_y: float,
+    mu_g: np.ndarray,
+    rho_g: float,
+    maxiter: int,
+    ftol: float,
+    inner_tol: float = 1e-4,
+) -> Tuple[np.ndarray, Dict]:
+    z0 = benchmark.decision(j, x_all, y_local, targets, link_targets)
+
+    def fun(z: np.ndarray) -> Tuple[float, np.ndarray]:
+        return benchmark.local_loss_grad(
+            j,
+            z,
+            x_all,
+            y_local,
+            targets,
+            link_targets,
+            lambda_r,
+            rho_r,
+            lambda_y,
+            rho_y,
+            mu_g,
+            rho_g,
+        )
+
+    res = minimize(
+        fun,
+        z0,
+        jac=True,
+        method="SLSQP",
+        bounds=list(zip(*benchmark.decision_bounds(j))),
+        options={"maxiter": maxiter, "ftol": ftol, "disp": False},
+    )
+    _, grad = fun(res.x)
+    stationarity = projected_grad_inf(
+        res.x, grad, *benchmark.decision_bounds(j)
+    )
+    return np.asarray(res.x, dtype=float), {
+        "iterations": int(res.nit),
+        "evaluations": int(res.nfev) + 1,
+        "stationarity": stationarity,
+        "success": bool(np.isfinite(stationarity) and stationarity <= inner_tol),
+    }
+
+
+class LocalDON(nn.Module):
+    """Node-specific online Deep Optimizer Network."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        width: int,
+        layers: int,
+        activation: str,
+        lower: float,
+        upper: float,
+        seed: int,
+    ) -> None:
+        super().__init__()
+        if width < 1 or layers < 1:
+            raise ValueError("DON width and layers must be >=1")
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.lower = torch.as_tensor(lower, dtype=torch.float64)
+        self.upper = torch.as_tensor(upper, dtype=torch.float64)
+        self.activation_name = activation.lower()
+        self.seed = int(seed)
+        torch.manual_seed(self.seed)
+
+        def act() -> nn.Module:
+            if self.activation_name == "tanh":
+                return nn.Tanh()
+            if self.activation_name == "relu":
+                return nn.ReLU()
+            if self.activation_name == "silu":
+                return nn.SiLU()
+            raise ValueError(f"Unsupported DON activation: {activation}")
+
+        modules: List[nn.Module] = []
+        in_features = self.input_dim
+        for _ in range(layers):
+            modules += [nn.Linear(in_features, width), act()]
+            in_features = width
+        modules.append(nn.Linear(in_features, self.output_dim))
+        self.net = nn.Sequential(*modules).double()
+
+        # Zero correction initially => current local decision is returned.
+        with torch.no_grad():
+            last = self.net[-1]
+            assert isinstance(last, nn.Linear)
+            last.weight.zero_()
+            last.bias.zero_()
+
+        self._initial_state = {
+            key: value.detach().clone() for key, value in self.state_dict().items()
+        }
+
+    def reset_to_initial(self) -> None:
+        self.load_state_dict(self._initial_state)
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        current = context[: self.output_dim]
+        # Exact feasible baseline, with per-call recentering in solve_local_don.
+        return torch.maximum(self.lower, torch.minimum(self.upper, current + self.net(context)))
+
+
+
+def solve_local_don(
+    benchmark: RegularTreeATCBenchmark,
+    j: int,
+    model: LocalDON,
+    x_all: np.ndarray,
+    y_local: np.ndarray,
+    targets: np.ndarray,
+    link_targets: np.ndarray,
+    lambda_r: np.ndarray,
+    rho_r: float,
+    lambda_y: np.ndarray,
+    rho_y: float,
+    mu_g: np.ndarray,
+    rho_g: float,
+    epochs: int,
+    lr: float,
+    check_every: int,
+    inner_tol: float,
+) -> Tuple[np.ndarray, Dict]:
+    context_np = benchmark.local_context(
+        j,
+        x_all,
+        y_local,
+        targets,
+        link_targets,
+        lambda_r,
+        rho_r,
+        lambda_y,
+        rho_y,
+        mu_g,
+        rho_g,
+    )
+    context = torch.as_tensor(context_np, dtype=torch.float64)
+    # Preserve learned features but remove the old correction at the new context.
+    # Adam state is deliberately reset because this recentering changes the bias.
+    with torch.no_grad():
+        model.net[-1].bias.sub_(model.net(context))
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    def assess():
+        with torch.no_grad():
+            zz = model(context).cpu().numpy()
+        vv, gg = benchmark.local_loss_grad(j, zz, x_all, y_local, targets,
+            link_targets, lambda_r, rho_r, lambda_y, rho_y, mu_g, rho_g)
+        return vv, projected_grad_inf(zz, gg, *benchmark.decision_bounds(j))
+    best_loss, stationarity = assess()
+    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    evaluations = 1
+    used = 0
+    if stationarity <= inner_tol:
+        return model(context).detach().numpy(), dict(iterations=0,
+            evaluations=1, stationarity=stationarity, success=True)
+    for epoch in range(epochs):
+        optimizer.zero_grad(set_to_none=True)
+        z = model(context)
+        loss = benchmark.local_loss_torch(
+            j,
+            z,
+            x_all,
+            y_local,
+            targets,
+            link_targets,
+            lambda_r,
+            rho_r,
+            lambda_y,
+            rho_y,
+            mu_g,
+            rho_g,
+        )
+        loss.backward()
+        optimizer.step()
+        used = epoch + 1
+        evaluations += 1
+
+        if used % check_every == 0 or used == epochs:
+            with torch.no_grad():
+                z_np = model(context).cpu().numpy()
+            _, grad = benchmark.local_loss_grad(
+                j,
+                z_np,
+                x_all,
+                y_local,
+                targets,
+                link_targets,
+                lambda_r,
+                rho_r,
+                lambda_y,
+                rho_y,
+                mu_g,
+                rho_g,
+            )
+            stationarity = projected_grad_inf(
+                z_np, grad, *benchmark.decision_bounds(j)
+            )
+            value, stationarity = assess()
+            evaluations += 2
+            if np.isfinite(value) and value < best_loss:
+                best_loss = value
+                best_state = {k: v.detach().clone() for k,v in model.state_dict().items()}
+            if stationarity <= inner_tol:
+                best_state = {k: v.detach().clone() for k,v in model.state_dict().items()}
+
+                break
+
+    model.load_state_dict(best_state)
+    with torch.no_grad():
+        z_final = model(context).cpu().numpy()
+    _, grad = benchmark.local_loss_grad(
+        j,
+        z_final,
+        x_all,
+        y_local,
+        targets,
+        link_targets,
+        lambda_r,
+        rho_r,
+        lambda_y,
+        rho_y,
+        mu_g,
+        rho_g,
+    )
+    stationarity = projected_grad_inf(
+        z_final, grad, *benchmark.decision_bounds(j)
+    )
+    return np.asarray(z_final, dtype=float), {
+        "iterations": int(used),  # epochs, not directly comparable to SQP iterations
+        "evaluations": int(evaluations) + 1,
+        "stationarity": stationarity,
+        "success": bool(np.isfinite(stationarity) and stationarity <= inner_tol),
+    }
+
+
+# ============================================================================
+# ATC coordination driver
+# ============================================================================
+
+
+@dataclass
+class SolverSettings:
+    rho_r: float = 5.0
+    rho_y: float = 5.0
+    rho_g: float = 5.0
+    tol: float = 1e-3
+    max_outer: int = 100
+    inner_sweeps: int = 1
+    sweep_order: str = "topdown"
+
+    sqp_maxiter: int = 250
+    sqp_ftol: float = 1e-12
+
+    don_width: int = 32
+    don_layers: int = 2
+    don_activation: str = "tanh"
+    don_epochs: int = 300
+    don_lr: float = 1e-3
+    don_check_every: int = 20
+    don_inner_tol: float = 1e-4
+    don_warm_start: bool = True
+
+    init_scale: float = 0.25
+
+
+def node_order(benchmark: RegularTreeATCBenchmark, order: str) -> List[int]:
+    if order == "topdown":
+        return list(range(benchmark.N))
+    if order == "bottomup":
+        return list(reversed(range(benchmark.N)))
+    raise ValueError("sweep_order must be 'topdown' or 'bottomup'")
+
+
+def build_don_models(
+    benchmark: RegularTreeATCBenchmark,
+    x_all: np.ndarray,
+    y_local: np.ndarray,
+    targets: np.ndarray,
+    link_targets: np.ndarray,
+    lambda_r: np.ndarray,
+    lambda_y: np.ndarray,
+    mu_g: np.ndarray,
+    settings: SolverSettings,
+    nn_seed: int,
+) -> List[LocalDON]:
+    models: List[LocalDON] = []
+    for j in range(benchmark.N):
+        context = benchmark.local_context(
+            j,
+            x_all,
+            y_local,
+            targets,
+            link_targets,
+            lambda_r,
+            settings.rho_r,
+            lambda_y,
+            settings.rho_y,
+            mu_g,
+            settings.rho_g,
+        )
+        models.append(
+            LocalDON(
+                input_dim=context.size,
+                output_dim=benchmark.node_decision_dim(j),
+                width=settings.don_width,
+                layers=settings.don_layers,
+                activation=settings.don_activation,
+                lower=benchmark.decision_bounds(j)[0],
+                upper=benchmark.decision_bounds(j)[1],
+                seed=nn_seed + 1009 * j,
+            )
+        )
+    return models
+
+
+def count_model_parameters(models: Sequence[nn.Module]) -> int:
+    return int(sum(p.numel() for model in models for p in model.parameters()))
+
+
+def solve_atc(
+    benchmark: RegularTreeATCBenchmark,
+    method: str,
+    seed: int,
+    nn_seed: int,
+    settings: SolverSettings,
+    reference: Optional[Dict] = None,
+) -> Dict:
+    method = method.upper()
+    if method not in {"SQP", "DON"}:
+        raise ValueError("method must be SQP or DON")
+
+    if min(settings.rho_r, settings.rho_y, settings.rho_g, settings.tol,
+           settings.don_inner_tol, settings.don_lr) <= 0:
+        raise ValueError("Penalty coefficients, tolerances and learning rate must be positive")
+    if min(settings.max_outer, settings.inner_sweeps, settings.don_epochs,
+           settings.don_check_every, settings.sqp_maxiter) < 1:
+        raise ValueError("Iteration budgets and check interval must be >= 1")
+    x_all, y_local, targets, link_targets = benchmark.initial_state(
+        seed, settings.init_scale
+    )
+    lambda_r = np.zeros(benchmark.config.N_edge, dtype=float)
+    lambda_y = np.zeros(benchmark.config.N_edge, dtype=float)
+    mu_g = np.zeros(benchmark.N, dtype=float)
+
+    start = time.perf_counter()  # Include DON model construction.
+    history = []
+    models: Optional[List[LocalDON]] = None
+    model_params = 0
+    if method == "DON":
+        models = build_don_models(
+            benchmark,
+            x_all,
+            y_local,
+            targets,
+            link_targets,
+            lambda_r,
+            lambda_y,
+            mu_g,
+            settings,
+            nn_seed,
+        )
+        model_params = count_model_parameters(models)
+
+    total_local_iterations = 0
+    total_evaluations = 0
+    local_failures = 0
+    converged = False
+    last_stationarity = math.inf
+    last_response_consistency = math.inf
+    last_link_consistency = math.inf
+    last_gviol = math.inf
+    last_change = math.inf
+
+    order = node_order(benchmark, settings.sweep_order)
+
+    outer = 0
+    for outer in range(1, settings.max_outer + 1):
+        x_before = x_all.copy()
+        y_before = y_local.copy()
+        t_before = targets.copy()
+        Y_before = link_targets.copy()
+        max_local_stationarity = 0.0
+
+        for _ in range(settings.inner_sweeps):
+            for j in order:
+                if method == "SQP":
+                    z, info = solve_local_sqp(
+                        benchmark,
+                        j,
+                        x_all,
+                        y_local,
+                        targets,
+                        link_targets,
+                        lambda_r,
+                        settings.rho_r,
+                        lambda_y,
+                        settings.rho_y,
+                        mu_g,
+                        settings.rho_g,
+                        settings.sqp_maxiter,
+                        settings.sqp_ftol,
+                        settings.don_inner_tol,
+                    )
+                else:
+                    assert models is not None
+                    if not settings.don_warm_start:
+                        models[j].reset_to_initial()
+                    z, info = solve_local_don(
+                        benchmark,
+                        j,
+                        models[j],
+                        x_all,
+                        y_local,
+                        targets,
+                        link_targets,
+                        lambda_r,
+                        settings.rho_r,
+                        lambda_y,
+                        settings.rho_y,
+                        mu_g,
+                        settings.rho_g,
+                        settings.don_epochs,
+                        settings.don_lr,
+                        settings.don_check_every,
+                        settings.don_inner_tol,
+                    )
+
+                benchmark.set_decision(
+                    j, z, x_all, y_local, targets, link_targets
+                )
+                total_local_iterations += int(info["iterations"])
+                total_evaluations += int(info["evaluations"])
+                max_local_stationarity = max(
+                    max_local_stationarity, float(info["stationarity"])
+                )
+                if not info["success"]:
+                    local_failures += 1
+
+        # Residuals after a full ATC sweep.
+        residual_r = benchmark.response_consistency_residuals(
+            x_all, y_local, targets
+        )
+        residual_y = benchmark.link_consistency_residuals(y_local, link_targets)
+        response_consistency = (
+            float(np.max(np.abs(residual_r))) if residual_r.size else 0.0
+        )
+        link_consistency = (
+            float(np.max(np.abs(residual_y))) if residual_y.size else 0.0
+        )
+        consistency = max(response_consistency, link_consistency)
+
+        g_raw = np.array(
+            [benchmark.inequality(x_all[j])[0] for j in range(benchmark.N)]
+        )
+        gviol = float(np.max(np.maximum(0.0, g_raw)))
+
+        dx = float(np.max(np.abs(x_all - x_before)))
+        dy = float(np.max(np.abs(y_local - y_before))) if y_local.size else 0.0
+        dt = float(np.max(np.abs(targets - t_before))) if targets.size else 0.0
+        dY = (
+            float(np.max(np.abs(link_targets - Y_before)))
+            if link_targets.size
+            else 0.0
+        )
+        iterate_change = max(dx, dy, dt, dY)
+
+        # AL multiplier updates for response, linking and physical inequality.
+        if residual_r.size:
+            lambda_r = lambda_r + settings.rho_r * residual_r
+            lambda_y = lambda_y + settings.rho_y * residual_y
+        mu_g = np.maximum(0.0, mu_g + settings.rho_g * g_raw)
+
+        # Re-evaluate every block at the SAME primal state and updated multipliers.
+        max_local_stationarity = 0.0
+        for j in range(benchmark.N):
+            z = benchmark.decision(j, x_all, y_local, targets, link_targets)
+            _, grad = benchmark.local_loss_grad(
+                j, z, x_all, y_local, targets, link_targets, lambda_r,
+                settings.rho_r, lambda_y, settings.rho_y, mu_g, settings.rho_g)
+            max_local_stationarity = max(max_local_stationarity,
+                projected_grad_inf(z, grad, *benchmark.decision_bounds(j)))
+            total_evaluations += 1
+        complementarity = float(np.max(np.abs(mu_g*g_raw)))
+        history.append(dict(outer=outer, consistency=consistency, gviol=gviol,
+            stationarity=max_local_stationarity, complementarity=complementarity,
+            elapsed=time.perf_counter()-start))
+        last_stationarity = max_local_stationarity
+        last_response_consistency = response_consistency
+        last_link_consistency = link_consistency
+        last_gviol = gviol
+        last_change = iterate_change
+
+        if max(consistency, gviol, max_local_stationarity, complementarity, iterate_change) <= settings.tol:
+            converged = True
+            break
+
+    elapsed = time.perf_counter() - start
+
+    J, _, _, root_response = benchmark.global_objective(x_all, link_targets)
+    r_explicit = benchmark.responses(x_all, y_local, targets)
+    residual_r = benchmark.response_consistency_residuals(x_all, y_local, targets)
+    residual_y = benchmark.link_consistency_residuals(y_local, link_targets)
+    response_consistency = (
+        float(np.max(np.abs(residual_r))) if residual_r.size else 0.0
+    )
+    link_consistency = (
+        float(np.max(np.abs(residual_y))) if residual_y.size else 0.0
+    )
+    consistency = max(response_consistency, link_consistency)
+    gviol = float(np.max(benchmark.constraint_violations(x_all)))
+    J_decomp = benchmark.decomposed_objective(x_all, y_local, targets)
+
+    result: Dict = {
+        "method": f"ATC-{method}",
+        "success": bool(converged),
+        "converged": bool(converged),
+        "local_failures": int(local_failures),
+        "history": history,
+        "complementarity": complementarity,
+        "seed": int(seed),
+        "nn_seed": int(nn_seed) if method == "DON" else -1,
+        "objective": float(J),
+        "objective_per_node": float(J / benchmark.N),
+        "decomposed_objective": float(J_decomp),
+        "objective_consistency_gap": float(abs(J - J_decomp)),
+        "root_response": float(root_response),
+        "explicit_root_response": float(r_explicit[0]),
+        "system_target_error": float(abs(root_response - benchmark.config.system_target)),
+        "response_consistency": response_consistency,
+        "link_consistency": link_consistency,
+        "consistency": consistency,
+        "constraint_violation": gviol,
+        "stationarity": float(last_stationarity),
+        "iterate_change": float(last_change),
+        "outer_iterations": int(outer),
+        "local_iterations": int(total_local_iterations),
+        "evaluations": int(total_evaluations),
+        "time": float(elapsed),
+        "model_parameters": int(model_params),
+        "x": x_all.copy(),
+        "y_local": y_local.copy(),
+        "response_targets": targets.copy(),
+        "link_targets": link_targets.copy(),
+        "lambda_r": lambda_r.copy(),
+        "lambda_y": lambda_y.copy(),
+        "mu_g": mu_g.copy(),
+    }
+
+    if reference is not None and reference.get("success", False):
+        ref_x = np.asarray(reference["x"], dtype=float)
+        ref_Y = np.asarray(reference["link_targets"], dtype=float)
+        result["objective_error"] = float(abs(J - float(reference["objective"])))
+        result["objective_per_node_error"] = float(
+            abs(J / benchmark.N - float(reference["objective"]) / benchmark.N)
+        )
+        result["x_error_inf"] = float(np.max(np.abs(x_all - ref_x)))
+        result["link_error_inf"] = (
+            float(np.max(np.abs(link_targets - ref_Y))) if ref_Y.size else 0.0
+        )
+        result["root_response_error_vs_ref"] = float(
+            abs(root_response - float(reference["root_response"]))
+        )
+    else:
+        result["objective_error"] = math.nan
+        result["objective_per_node_error"] = math.nan
+        result["x_error_inf"] = math.nan
+        result["link_error_inf"] = math.nan
+        result["root_response_error_vs_ref"] = math.nan
+
+    return result
+
+
+# ============================================================================
+# Controlled CASE definitions
+# ============================================================================
+
+
+def cfg(**kwargs) -> BenchmarkConfig:
+    return BenchmarkConfig(**kwargs)
+
+
+CASE1_DEFINITIONS: Dict[str, Dict] = {
+    "1A": {
+        "description": "local physical-design dimension m",
+        "configs": [cfg(m=m, B=2, D=3, kappa="Q2") for m in [2, 4, 8, 16, 32]],
+    },
+    "1B": {
+        "description": "coordination breadth / branching factor B",
+        "configs": [cfg(m=8, B=B, D=2, kappa="Q2") for B in [2, 3, 4, 6, 8]],
+    },
+    "1C": {
+        "description": "hierarchical depth scaling D (B fixed at 2)",
+        "configs": [cfg(m=8, B=2, D=D, kappa="Q2") for D in [2, 3, 4, 5]],
+    },
+    "1D": {
+        "description": "local objective nonlinearity kappa",
+        "configs": [cfg(m=8, B=2, D=3, kappa=k) for k in KAPPA_CLASSES],
+    },
+    "1E": {
+        "description": "physical inequality severity b (optional)",
+        "configs": [
+            cfg(m=8, B=2, D=3, kappa="Q2", b=b)
+            for b in [0.00, 0.10, 0.20, 0.30]
+        ],
+    },
+}
+
+CASE2_CONFIG = cfg(m=8, B=2, D=3, kappa="Q2")
+CASE2_SWEEPS = {
+    "2A": ("don_layers", [1, 2, 3, 5]),
+    "2B": ("don_width", [8, 16, 32, 64, 128]),
+    "2C": ("don_lr", [1e-2, 5e-3, 1e-3, 5e-4, 1e-4]),
+    "2D": ("don_epochs", [100, 300, 1000, 3000]),
+    "2E": ("don_activation", ["relu", "tanh", "silu"]),
+    "2F": ("don_warm_start", [False, True]),
+}
+
+
+# ============================================================================
+# Experiment utilities
+# ============================================================================
+
+
+def result_row(
+    case_name: str,
+    config: BenchmarkConfig,
+    settings: SolverSettings,
+    result: Dict,
+    variant_name: str = "",
+    variant_value: object = "",
+) -> Dict:
+    return {
+        "case": case_name,
+        "variant_name": variant_name,
+        "variant_value": variant_value,
+        "method": result["method"],
+        "m": config.m,
+        "B": config.B,
+        "D": config.D,
+        "N_ATC": config.N_ATC,
+        "N_edge": config.N_edge,
+        "N_internal": config.N_internal,
+        "n_design_total": config.n_design_total,
+        "n_local_design_total": config.n_local_design_total,
+        "n_response_target_total": config.n_response_target_total,
+        "n_link_copy_total": config.n_link_copy_total,
+        "n_link_target_total": config.n_link_target_total,
+        "n_decomposed_primal_total": config.n_decomposed_primal_total,
+        "kappa": config.kappa,
+        "alpha": config.alpha,
+        "response_eta": config.response_eta,
+        "link_beta": config.link_beta,
+        "b": config.b,
+        "system_target": config.system_target,
+        "system_weight": config.system_weight,
+        "rho_r": settings.rho_r,
+        "rho_y": settings.rho_y,
+        "rho_g": settings.rho_g,
+        "tol": settings.tol,
+        "seed": result.get("seed", -1),
+        "nn_seed": result.get("nn_seed", -1),
+        "success": result["success"],
+        "converged": result.get("converged", result["success"]),
+        "objective": result["objective"],
+        "objective_per_node": result.get(
+            "objective_per_node", result["objective"] / config.N_ATC
+        ),
+        "decomposed_objective": result.get("decomposed_objective", result["objective"]),
+        "objective_consistency_gap": result.get("objective_consistency_gap", 0.0),
+        "objective_error": result.get("objective_error", 0.0),
+        "objective_per_node_error": result.get("objective_per_node_error", 0.0),
+        "x_error_inf": result.get("x_error_inf", 0.0),
+        "link_error_inf": result.get("link_error_inf", 0.0),
+        "root_response": result["root_response"],
+        "system_target_error": result.get(
+            "system_target_error", abs(result["root_response"] - config.system_target)
+        ),
+        "root_response_error_vs_ref": result.get("root_response_error_vs_ref", 0.0),
+        "response_consistency": result.get("response_consistency", 0.0),
+        "link_consistency": result.get("link_consistency", 0.0),
+        "consistency": result.get("consistency", 0.0),
+        "constraint_violation": result.get("constraint_violation", 0.0),
+        "stationarity": result.get("stationarity", 0.0),
+        "complementarity": result.get("complementarity", math.nan),
+        "history_json": json.dumps(result.get("history", [])),
+        "reference_kind": "best of three SLSQP starts; total search time; not certified global",
+        "reference_starts": result.get("reference_starts", 3),
+        "iterate_change": result.get("iterate_change", 0.0),
+        "outer_iterations": result.get("outer_iterations", result.get("iterations", 0)),
+        "local_iterations": result.get("local_iterations", result.get("iterations", 0)),
+        "evaluations": result.get("evaluations", 0),
+        "time": result["time"],
+        "model_parameters": result.get("model_parameters", 0),
+        "don_width": settings.don_width,
+        "don_layers": settings.don_layers,
+        "don_activation": settings.don_activation,
+        "don_epochs": settings.don_epochs,
+        "don_lr": settings.don_lr,
+        "don_warm_start": settings.don_warm_start,
+    }
+
+
+def aio_row(
+    case_name: str,
+    config: BenchmarkConfig,
+    settings: SolverSettings,
+    ref: Dict,
+) -> Dict:
+    result = {
+        **ref,
+        "seed": -1,
+        "nn_seed": -1,
+        "objective_error": 0.0,
+        "objective_per_node_error": 0.0,
+        "x_error_inf": 0.0,
+        "link_error_inf": 0.0,
+        "system_target_error": abs(ref["root_response"] - config.system_target),
+        "root_response_error_vs_ref": 0.0,
+        "response_consistency": 0.0,
+        "link_consistency": 0.0,
+        "consistency": 0.0,
+        "constraint_violation": ref["constraint_violation"],
+        "stationarity": math.nan,  # AIO KKT not measured; never fabricate zero.
+        "iterate_change": 0.0,
+        "outer_iterations": ref["iterations"],
+        "local_iterations": ref["iterations"],
+        "model_parameters": 0,
+        "converged": ref["success"],
+        "decomposed_objective": ref["objective"],
+        "objective_consistency_gap": 0.0,
+    }
+    return result_row(case_name, config, settings, result)
+
+
+def run_one_config(
+    case_name: str,
+    config: BenchmarkConfig,
+    settings: SolverSettings,
+    seeds: Sequence[int],
+    nn_seeds: Sequence[int],
+    methods: Sequence[str],
+    include_aio: bool,
+    variant_name: str = "",
+    variant_value: object = "",
+) -> List[Dict]:
+    benchmark = RegularTreeATCBenchmark(config)
+    ref = solve_aio_sqp(benchmark)
+    if not ref["success"]:
+        print(f"WARNING: AIO reference did not report success: {ref['message']}")
+
+    rows: List[Dict] = []
+    if include_aio:
+        ar = aio_row(case_name, config, settings, ref)
+        ar["variant_name"] = variant_name
+        ar["variant_value"] = variant_value
+        rows.append(ar)
+
+    for seed in seeds:
+        if "sqp" in methods:
+            res = solve_atc(
+                benchmark,
+                method="SQP",
+                seed=seed,
+                nn_seed=-1,
+                settings=settings,
+                reference=ref,
+            )
+            rows.append(
+                result_row(case_name, config, settings, res, variant_name, variant_value)
+            )
+            print(
+                f"[{case_name}] {config.short_label()} seed={seed} ATC-SQP "
+                f"ok={res['success']} Jerr={res['objective_error']:.3e} "
+                f"cR={res['response_consistency']:.2e} "
+                f"cY={res['link_consistency']:.2e} "
+                f"g={res['constraint_violation']:.2e} t={res['time']:.3f}s"
+            )
+
+        if "don" in methods:
+            for nn_seed in nn_seeds:
+                res = solve_atc(
+                    benchmark,
+                    method="DON",
+                    seed=seed,
+                    nn_seed=nn_seed,
+                    settings=settings,
+                    reference=ref,
+                )
+                rows.append(
+                    result_row(
+                        case_name, config, settings, res, variant_name, variant_value
+                    )
+                )
+                print(
+                    f"[{case_name}] {config.short_label()} seed={seed} nn={nn_seed} "
+                    f"ATC-DON ok={res['success']} Jerr={res['objective_error']:.3e} "
+                    f"cR={res['response_consistency']:.2e} "
+                    f"cY={res['link_consistency']:.2e} "
+                    f"g={res['constraint_violation']:.2e} t={res['time']:.3f}s"
+                )
+
+    return rows
+
+
+def write_rows(rows: List[Dict], output_csv: Path) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    keys: List[str] = []
+    seen = set()
+    for row in rows:
+        for k in row.keys():
+            if k not in seen:
+                keys.append(k)
+                seen.add(k)
+    with output_csv.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_metadata(output_csv: Path, args: argparse.Namespace, settings: SolverSettings) -> None:
+    meta = {
+        "created_unix": time.time(),
+        "environment": {"torch": torch.__version__, "numpy": np.__version__, "device": "cpu", "dtype": "float64", "threads": torch.get_num_threads()},
+        "args": vars(args),
+        "solver_settings": asdict(settings),
+        "case1": {
+            k: {
+                "description": v["description"],
+                "configs": [asdict(c) for c in v["configs"]],
+            }
+            for k, v in CASE1_DEFINITIONS.items()
+        },
+        "case2_config": asdict(CASE2_CONFIG),
+        "case2_sweeps": CASE2_SWEEPS,
+    }
+    output_csv.with_suffix(".json").write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
+    )
+
+
+# ============================================================================
+# Self-test
+# ============================================================================
+
+
+def finite_difference_gradient(fun, z: np.ndarray, h: float = 1e-6) -> np.ndarray:
+    out = np.zeros_like(z, dtype=float)
+    for i in range(z.size):
+        zp = z.copy(); zp[i] += h
+        zm = z.copy(); zm[i] -= h
+        out[i] = (fun(zp) - fun(zm)) / (2.0 * h)
+    return out
+
+
+def revision_self_test():
+    import sys
+    a=sys.modules[__name__]
+    import numpy as np
+    import torch
+    c=a.BenchmarkConfig(); b=a.RegularTreeATCBenchmark(c)
+    assert (c.n_local_design_total,c.n_design_total,c.n_decomposed_primal_total)==(56,59,71)
+    for v in [c.lower,c.upper]:
+     x=np.full((b.N,b.m),v); Y=np.full(c.N_internal,v)
+     y=b.consistent_link_copies(Y); t=b.consistent_targets(x,Y)
+     b.check_decomposition(x,Y)
+     for j in range(b.N):
+      z=b.decision(j,x,y,t,Y); lo,hi=b.decision_bounds(j)
+      assert np.all(z>=lo-1e-12) and np.all(z<=hi+1e-12)
+    x,y,t,Y=b.initial_state(3,.25)
+    lr=np.ones(c.N_edge)*.2;ly=lr.copy();mu=np.ones(b.N)*.3
+    for j in [0,1,6]:
+     z=b.decision(j,x,y,t,Y)
+     args=(j,z,x,y,t,Y,lr,5.,ly,5.,mu,5.)
+     val,g=b.local_loss_grad(*args)
+     zz=torch.tensor(z,requires_grad=True)
+     vv=b.local_loss_torch(j,zz,*args[2:]);vv.backward()
+     assert np.allclose(vv.item(),val) and np.allclose(zz.grad.numpy(),g)
+    model=a.build_don_models(b,x,y,t,Y,lr,ly,mu,a.SolverSettings(),0)[0]
+    z,info=a.solve_local_don(b,0,model,x,y,t,Y,lr,5.,ly,5.,mu,5.,1,.001,1,1e-12)
+    assert not info['success']
+    print('counts, feasible response bounds, root/internal/leaf torch gradients, failure flag: PASS')
+
+
+def self_test() -> None:
+    revision_self_test()
+    rng = np.random.default_rng(123)
+    for B, D, kappa in [(2, 2, "Q2"), (2, 3, "Q4"), (3, 3, "EXP")]:
+        config = BenchmarkConfig(m=4, B=B, D=D, kappa=kappa)
+        bm = RegularTreeATCBenchmark(config)
+        x = rng.uniform(-0.5, 0.8, size=(bm.N, bm.m))
+        Y = rng.uniform(-0.4, 0.4, size=config.N_internal)
+        bm.check_decomposition(x, Y)
+
+        # AIO analytic gradient check wrt both x and physical shared links Y.
+        nx = bm.N * bm.m
+        flat = np.concatenate([x.ravel(), Y])
+
+        def aio_fun(v: np.ndarray) -> float:
+            xx = v[:nx].reshape(bm.N, bm.m)
+            yy = v[nx:]
+            return bm.global_objective(xx, yy)[0]
+
+        J, gx, gy, _ = bm.global_objective(x, Y)
+        analytic = np.concatenate([gx.ravel(), gy])
+        fd = finite_difference_gradient(aio_fun, flat)
+        err = float(np.max(np.abs(fd - analytic)))
+        if err > 4e-5:
+            raise AssertionError(("AIO gradient", B, D, kappa, err, J))
+
+        # Local AL gradient check, including linking-variable consistency.
+        y_local = bm.consistent_link_copies(Y)
+        targets = bm.consistent_targets(x, Y)
+        lambda_r = rng.normal(scale=0.2, size=config.N_edge)
+        lambda_y = rng.normal(scale=0.2, size=config.N_edge)
+        mu_g = np.abs(rng.normal(scale=0.2, size=bm.N))
+        j = 1 if bm.N > 1 else 0
+        z = bm.decision(j, x, y_local, targets, Y)
+        val, g = bm.local_loss_grad(
+            j, z, x, y_local, targets, Y,
+            lambda_r, 3.0, lambda_y, 2.5, mu_g, 4.0
+        )
+        fdg = finite_difference_gradient(
+            lambda zz: bm.local_loss_grad(
+                j, zz, x, y_local, targets, Y,
+                lambda_r, 3.0, lambda_y, 2.5, mu_g, 4.0
+            )[0],
+            z,
+        )
+        err2 = float(np.max(np.abs(fdg - g)))
+        if err2 > 6e-5:
+            raise AssertionError(("local gradient", B, D, kappa, err2, val))
+
+    print(
+        "SELF-TEST PASSED: B-ary tree, nonlinear response model, shared sibling "
+        "linking variables, response/link consistency, exact AIO decomposition, "
+        "and analytic gradients."
+    )
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+
+def parse_int_list(text: str) -> List[int]:
+    return [int(v.strip()) for v in text.split(",") if v.strip()]
+
+
+def make_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Controlled ATC-SQP vs ATC-DON benchmark with target-response and "
+            "shared linking-variable coordination."
+        ),
+    )
+    p.add_argument(
+        "--case",
+        default="1A",
+        choices=[
+            "1A", "1B", "1C", "1D", "1E",
+            "2A", "2B", "2C", "2D", "2E", "2F",
+            "case1", "case2", "all",
+        ],
+    )
+    p.add_argument("--seeds", default="1", help="comma-separated design initialization seeds")
+    p.add_argument("--nn-seeds", default="1", help="comma-separated DON weight seeds")
+    p.add_argument("--methods", default="sqp,don", help="comma-separated subset of sqp,don")
+    p.add_argument("--no-aio", action="store_true", help="do not write AIO reference rows")
+    p.add_argument("--output", default="atc_benchmark_final_results.csv")
+    p.add_argument("--limit-configs", type=int, default=0, help="debug: keep only first N configs/sweep values")
+    p.add_argument("--self-test", action="store_true")
+    p.add_argument("--self-test-only", action="store_true")
+
+    # Shared ATC settings.
+    p.add_argument("--rho-r", type=float, default=5.0, help="response-consistency AL penalty")
+    p.add_argument("--rho-y", type=float, default=5.0, help="linking-consistency AL penalty")
+    p.add_argument("--rho-g", type=float, default=5.0, help="PHR inequality penalty")
+    p.add_argument("--tol", type=float, default=1e-3, help="ATC outer epsilon")
+    p.add_argument("--max-outer", type=int, default=100)
+    p.add_argument("--inner-sweeps", type=int, default=1)
+    p.add_argument("--sweep-order", choices=["topdown", "bottomup"], default="topdown")
+    p.add_argument("--init-scale", type=float, default=0.25)
+
+    # Backward-compatible alias for the old response-consistency penalty name.
+    p.add_argument("--rho-c", type=float, default=None, help=argparse.SUPPRESS)
+
+    # SQP local solver.
+    p.add_argument("--sqp-maxiter", type=int, default=250)
+    p.add_argument("--sqp-ftol", type=float, default=1e-12)
+
+    # DON baseline settings; CASE2 changes one at a time around these values.
+    p.add_argument("--don-width", type=int, default=32)
+    p.add_argument("--don-layers", type=int, default=2)
+    p.add_argument("--don-activation", choices=["tanh", "relu", "silu"], default="tanh")
+    p.add_argument("--don-epochs", type=int, default=300)
+    p.add_argument("--don-lr", type=float, default=1e-3)
+    p.add_argument("--don-check-every", type=int, default=20)
+    p.add_argument("--don-inner-tol", type=float, default=1e-4)
+    p.add_argument("--don-warm-start", dest="don_warm_start", action="store_true")
+    p.add_argument("--no-don-warm-start", dest="don_warm_start", action="store_false")
+    p.set_defaults(don_warm_start=True)
+    return p
+
+
+def settings_from_args(args: argparse.Namespace) -> SolverSettings:
+    rho_r = args.rho_r if args.rho_c is None else args.rho_c
+    return SolverSettings(
+        rho_r=rho_r,
+        rho_y=args.rho_y,
+        rho_g=args.rho_g,
+        tol=args.tol,
+        max_outer=args.max_outer,
+        inner_sweeps=args.inner_sweeps,
+        sweep_order=args.sweep_order,
+        sqp_maxiter=args.sqp_maxiter,
+        sqp_ftol=args.sqp_ftol,
+        don_width=args.don_width,
+        don_layers=args.don_layers,
+        don_activation=args.don_activation,
+        don_epochs=args.don_epochs,
+        don_lr=args.don_lr,
+        don_check_every=args.don_check_every,
+        don_inner_tol=args.don_inner_tol,
+        don_warm_start=args.don_warm_start,
+        init_scale=args.init_scale,
+    )
+
+
+def selected_case_names(case_arg: str) -> Tuple[List[str], List[str]]:
+    c1: List[str] = []
+    c2: List[str] = []
+    if case_arg in CASE1_DEFINITIONS:
+        c1 = [case_arg]
+    elif case_arg in CASE2_SWEEPS:
+        c2 = [case_arg]
+    elif case_arg == "case1":
+        c1 = list(CASE1_DEFINITIONS)
+    elif case_arg == "case2":
+        c2 = list(CASE2_SWEEPS)
+    elif case_arg == "all":
+        c1 = list(CASE1_DEFINITIONS)
+        c2 = list(CASE2_SWEEPS)
+    return c1, c2
+
+
+def main() -> None:
+    parser = make_parser()
+    args = parser.parse_args()
+
+    if args.self_test or args.self_test_only:
+        self_test()
+        if args.self_test_only:
+            return
+
+    seeds = parse_int_list(args.seeds)
+    nn_seeds = parse_int_list(args.nn_seeds)
+    if not seeds:
+        raise ValueError("At least one --seeds value is required")
+    if not nn_seeds:
+        raise ValueError("At least one --nn-seeds value is required")
+
+    methods = [m.strip().lower() for m in args.methods.split(",") if m.strip()]
+    if any(m not in {"sqp", "don"} for m in methods):
+        raise ValueError("--methods must contain only sqp and/or don")
+
+    base_settings = settings_from_args(args)
+    case1_names, case2_names = selected_case_names(args.case)
+    rows: List[Dict] = []
+
+    for case_name in case1_names:
+        definition = CASE1_DEFINITIONS[case_name]
+        configs = list(definition["configs"])
+        if args.limit_configs > 0:
+            configs = configs[: args.limit_configs]
+        print(f"\n=== {case_name}: {definition['description']} ===")
+        for config in configs:
+            rows.extend(
+                run_one_config(
+                    case_name,
+                    config,
+                    copy.deepcopy(base_settings),
+                    seeds,
+                    nn_seeds,
+                    methods,
+                    include_aio=not args.no_aio,
+                )
+            )
+
+    for case_name in case2_names:
+        field, values = CASE2_SWEEPS[case_name]
+        values = list(values)
+        if args.limit_configs > 0:
+            values = values[: args.limit_configs]
+        print(f"\n=== {case_name}: DON sensitivity of {field} ===")
+
+        for value in values:
+            s = copy.deepcopy(base_settings)
+            setattr(s, field, value)
+            rows.extend(
+                run_one_config(
+                    case_name,
+                    CASE2_CONFIG,
+                    s,
+                    seeds,
+                    nn_seeds,
+                    methods,
+                    include_aio=not args.no_aio,
+                    variant_name=field,
+                    variant_value=value,
+                )
+            )
+
+    output = Path(args.output)
+    write_rows(rows, output)
+    save_metadata(output, args, base_settings)
+    print(f"\nSaved {len(rows)} rows -> {output.resolve()}")
+    print(f"Metadata -> {output.with_suffix('.json').resolve()}")
+
+
+if __name__ == "__main__":
+    main()
